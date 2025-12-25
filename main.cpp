@@ -2,142 +2,153 @@
 #include <string>
 #include <print>
 #include <vector>
-#include <unordered_set>
-#include <unordered_map>
 #include <iostream>
+#include <string_view>
+#include <thread>
+#include <shared_mutex>
+#include <functional> // for std::hash
+#include "absl/container/flat_hash_map.h"
 
 using asio::ip::tcp;
-using std::println;
 using common_token = asio::as_tuple_t<asio::use_awaitable_t<>>;
 using tcp_acceptor = common_token::as_default_on_t<tcp::acceptor>;
 using tcp_socket = common_token::as_default_on_t<tcp::socket>;
-using Database = std::unordered_map<std::string, std::string>;
 
+const size_t SHARD_COUNT = 64;
 
-std::unordered_set<std::string> allowed_queries = {"set", "get"};
+struct DB {
+    struct alignas(64) Shard {
+        absl::flat_hash_map<std::string, std::string> map;
+        std::shared_mutex mutex;
+    };
 
-std::vector<std::string> parse_query(const std::string& message_buffer) {
-    std::string clean_msg = message_buffer;
-    if (!clean_msg.empty() && clean_msg.back() == '\r') clean_msg.pop_back();
+    std::vector<Shard> shards;
 
-    size_t firstSpace = clean_msg.find(' ');
-
-    if (firstSpace == std::string::npos) return {};
-
-    std::string cmd = clean_msg.substr(0, firstSpace);
-
-    if (cmd == "set") {
-        size_t secondSpace = clean_msg.find(' ', firstSpace + 1);
-
-        if (secondSpace != std::string::npos) {
-            std::string key = clean_msg.substr(firstSpace + 1, secondSpace - firstSpace - 1);
-            std::string val = clean_msg.substr(secondSpace + 1);
-            return {cmd, key, val};
-        }
-    }
-    else if (cmd == "get") {
-        std::string key = clean_msg.substr(firstSpace + 1);
-        return {cmd, key};
+    DB() : shards(SHARD_COUNT) {
+        for(auto& s : shards) s.map.reserve(4000);
     }
 
-    return {};
-}
-
-void set_data(std::vector<std::string>& parsed_query, Database& db) {
-    std::string key = parsed_query[1];
-
-    db[key] = std::move(parsed_query[2]);
-
-}
-
-std::string get_data(const std::string& raw_key, Database& db) {
-    std::string key = raw_key;
-
-    key.erase(key.find_last_not_of(" \n\r\t") + 1);
-
-    auto it = db.find(key);
-
-    if (it != db.end()) {
-        return it->second;
+    //determine which shard owns the key
+    size_t get_shard_index(std::string_view key) {
+        return std::hash<std::string_view>{}(key) % SHARD_COUNT;
     }
 
-    return "(empty)\n";
+    std::string get(std::string_view key) {
+        size_t idx = get_shard_index(key);
+        Shard& shard = shards[idx];
+
+        std::shared_lock lock(shard.mutex);
+        auto it = shard.map.find(key);
+        if (it != shard.map.end()) return it->second;
+        return "(empty)\n";
+    }
+
+    void set(std::string_view key, std::string_view value) {
+        size_t idx = get_shard_index(key);
+        Shard& shard = shards[idx];
+
+        std::unique_lock lock(shard.mutex);
+        shard.map.emplace(key, value);
+    }
+};
+
+struct ParsedCommand {
+    std::string_view cmd;
+    std::string_view key;
+    std::string_view value;
+};
+
+std::string_view trim_right(std::string_view s) {
+    auto pos = s.find_last_not_of(" \n\r\t");
+    if (pos == std::string_view::npos) return {};
+    return s.substr(0, pos + 1);
 }
 
-asio::awaitable<void> handle_query(tcp_socket socket, Database& db) {
+ParsedCommand parse_line(std::string_view line) {
+    line = trim_right(line);
+    if (line.empty()) return {};
+
+    ParsedCommand res;
+    size_t first_space = line.find(' ');
+
+    if (first_space == std::string_view::npos) {
+        res.cmd = line;
+        return res;
+    }
+
+    res.cmd = line.substr(0, first_space);
+    size_t second_space = line.find(' ', first_space + 1);
+
+    if (second_space == std::string_view::npos) {
+        res.key = line.substr(first_space + 1);
+    } else {
+        res.key = line.substr(first_space + 1, second_space - first_space - 1);
+        res.value = line.substr(second_space + 1);
+    }
+    return res;
+}
+
+asio::awaitable<void> handle_query(tcp_socket socket, DB& db) {
     try {
-        std::string data;
-        std::string dir = "velocity#~ ";
+        socket.set_option(tcp::no_delay(true)); // Disable Nagle
+
+        std::string buffer_storage;
         for (;;) {
-            co_await asio::async_write(socket, asio::buffer(dir));
-            auto [read_err, n] = co_await asio::async_read_until(socket, asio::dynamic_buffer(data, 1024), '\n');
+            auto [read_err, n] = co_await asio::async_read_until(socket, asio::dynamic_buffer(buffer_storage, 1024), '\n');
+            if (read_err) break;
 
-            if (read_err) {
-                if (read_err != asio::error::eof)
-                    std::println("[ERROR] Read error: {}", read_err.message());
-                break;
+            std::string_view line_view(buffer_storage.data(), n);
+            auto parsed = parse_line(line_view);
+
+            if (parsed.cmd == "set" && !parsed.key.empty()) {
+                db.set(parsed.key, parsed.value);
+            }
+            else if (parsed.cmd == "get" && !parsed.key.empty()) {
+                std::string res = db.get(parsed.key);
+                co_await asio::async_write(socket, asio::buffer(res));
+                co_await asio::async_write(socket, asio::buffer("\n"));
             }
 
-            std::string line = data.substr(0, n);
-            data.erase(0, n);
-
-            std::vector<std::string> parsed_query = parse_query(line);
-            if (parsed_query.empty()) {
-                std::string msg = "invalid Query\n";
-                co_await asio::async_write(socket, asio::buffer(msg));
-                continue;
-            }
-
-            std::string user_request = parsed_query[0];
-            if (user_request == "set") {
-                if (parsed_query.size() < 3) {
-                    std::string msg = "invalid Query\n";
-                    co_await asio::async_write(socket, asio::buffer(msg));
-                    continue;
-                }
-                set_data(parsed_query, db);
-            }else if (user_request == "get") {
-                if (parsed_query.size() < 2) {
-                    std::string msg = "invalid Query\n";
-                    co_await asio::async_write(socket, asio::buffer(msg));
-                    continue;
-                }
-                std::string data = get_data(parsed_query[1], db);
-                co_await asio::async_write(socket, asio::buffer(data));
-                continue;
-
-            }else {
-                std::string msg = "invalid Query\n";
-                co_await asio::async_write(socket, asio::buffer(msg));
-                continue;
-            }
+            buffer_storage.erase(0, n);
         }
-    } catch (std::exception& e) {
-        std::println("Exception in handler: {}", e.what());
-    }
+    } catch (...) {}
 }
 
-asio::awaitable<void> listener(Database& db) {
+asio::awaitable<void> listener(DB& db) {
     auto executor = co_await asio::this_coro::executor;
     tcp_acceptor acceptor(executor, {tcp::v4(), 8999});
+    acceptor.set_option(asio::socket_base::reuse_address(true));
+
+    std::println("Server running on port 8999 (Sharded + Padded)");
+
     for (;;) {
-       auto[accept_err, socket] = co_await acceptor.async_accept(executor);
-        if (accept_err) {
-            println("[ERROR] {}", accept_err.message());
+        auto [err, socket] = co_await acceptor.async_accept(executor);
+        if (!err) {
+            asio::co_spawn(executor, handle_query(std::move(socket), db), asio::detached);
         }
-        asio::co_spawn(executor, handle_query(std::move(socket), db), asio::detached);
     }
 }
 
+int main() {
+    DB db;
+    unsigned int thread_count = std::thread::hardware_concurrency();
 
-int main(int argc, const char* argv[]) {
-    Database db;
-
-    asio::io_context io_context(1);
+    asio::io_context io_context(thread_count);
     asio::signal_set signals(io_context, SIGINT, SIGTERM);
     signals.async_wait([&](auto, auto){ io_context.stop(); });
 
-    co_spawn(io_context, listener(db), asio::detached);
+    asio::co_spawn(io_context, listener(db), asio::detached);
+
+    std::vector<std::thread> threads;
+    std::println("Starting {} worker threads...", thread_count);
+
+    for (unsigned int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&io_context] {
+            io_context.run();
+        });
+    }
 
     io_context.run();
+
+    for (auto& t : threads) t.join();
 }
